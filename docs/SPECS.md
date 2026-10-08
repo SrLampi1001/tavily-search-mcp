@@ -1,57 +1,53 @@
-# `rust-agent-tavily-mcp` — MCP server
+# `tavily-search-mcp` — MCP server
 
-> **Status:** spec only, not yet implemented. The behaviour described  below is the **minimum required to be considered a viable general-purpose  web-search tool** for the agent. Implementation happens in this repo;  integration with the agent happens by editing `config/mcp.toml` in the  `rust-agent` repo.
+> **Status:** v0.1 implemented. Speaks MCP 2026-07-28 over Streamable HTTP and stdio, built on FastMCP 4.0.11. The behaviour described below is the contract this server commits to.
 
-A [Model Context Protocol](https://modelcontextprotocol.io/) server that exposes a single agent-tuned web-search tool to the `rust-agent` over stdio:
+A [Model Context Protocol](https://modelcontextprotocol.io/specification/2026-07-28) server that exposes the Tavily `/search` and `/extract` endpoints as MCP tools for any modern AI agent. No agent-specific integration; runs as a standalone streamable HTTP server that any modern MCP client can connect to.
 
-| Tool | Backend | Cost | Best for |
-| --- | --- | --- | --- |
-| `web_search` | Tavily Search API | 1,000 requests/month free tier | General, question-shaped web search with **structured results** (title, URL, content snippet, optional direct answer). Agent-tuned: result content is pre-cleaned, optionally includes an LLM-generated answer. |
+| Tool | Backend | Best for |
+| --- | --- | --- |
+| `web_search` | Tavily `/search` | Question-shaped, long-tail, or generally web-shaped queries. Returns clean, LLM-friendly snippets with optional direct answer and per-result `raw_content`. Charges Tavily credits. |
+| `extract_url` | Tavily `/extract` | Fetching clean content for 1–20 known URLs in a single call. Charges per-URL credits. |
 
-The Rust agent spawns this server as a child process via the official [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) crate, lists the tool, and registers it as a regular `rig::tool::Tool`. From the agent's point of view the tool is indistinguishable from any other.
+| Prompt | Use |
+| --- | --- |
+| `research_topic` | Plan a single `web_search` call, including the empty-result fallback and the call-counter budget reminder. |
+| `fetch_document` | Plan a single `extract_url` call with a focus question; reminds the model about the per-URL `raw_content` cap and `failed_results`. |
 
 ---
 
 ## 1. Why this server exists
 
-This server is one of **three** that together replace the current bundled `mcp-servers/web-search/` MCP. The bundle is being split so each backend (DDG, Firecrawl, Tavily) can be enabled, disabled, scaled, and rate-limited independently. The agent code is **unaware** of the split — it still sees one `web_search`-shaped tool per server, with the server-name prefix disambiguating which backend answered.
+Tavily is the general-purpose path against a credit budget. Where the [DuckDuckGo Instant Answer API](https://duckduckgo.com/api) only answers entity-shaped queries and returns empty `200`s for long-tail / question-shaped input, Tavily is designed for AI-agent consumption from day one: it returns clean, structured results across the full web (no Instant-Answer-API limitations) with a content snippet per result that's already LLM-friendly. The signup tier comes with 1,000 credits/month; pass-as-you-go applies after consumption — the server deliberately treats credit spend as budget-by-self-count, since Tavily has no live remaining-balance endpoint.
 
-Tavily is the **general-purpose** path. Where the DDG tool is limited to entity-like queries, and the Firecrawl tool spends credits to return full page bodies, Tavily is designed for AI-agent consumption from day one: it returns clean, structured results across the full web (no Instant-Answer-API limitations) with a content snippet per result that's already LLM-friendly. The free tier (1,000 requests/month) is generous for an agent that budgets its queries.
+This server does not try to replace deep page-body extraction. For deep-content needs that warrant the spend, a sibling Firecrawl MCP is the right tool. `extract_url` here is the lightweight path for a small, known set of URLs the model already has pointers to.
 
-The other two MCPs in the set:
+### 1.1 Why a self-hosted MCP and not Tavily's hosted one
 
-- **DuckDuckGo** for entity-like queries (free, no key, snippets only).
-- **Firecrawl** for deep content extraction (paid; returns full page bodies as markdown).
-
-Together the three give the agent a layered search strategy:
-
-| Need | Reach for |
-| --- | --- |
-| Entity lookup (person, place, product, standard) | `duckduckgo__web_search` |
-| General question-shaped query with clean snippets | `tavily__web_search` ← **this tool** |
-| Long-tail / question-shaped query that needs the **full page body** as markdown | `firecrawl__web_search` |
-
-The tool description (§3) and the agent's preamble (see [`src/agent/prompt.rs`](https://github.com/example/rust-agent/blob/main/src/agent/prompt.rs)) encode this layering.
+Tavily also exposes an [official hosted MCP](https://docs.tavily.com/documentation/mcp.md) at `mcp.tavily.com/mcp/` — pick that when you want Tavily with zero setup. Pick this server when you want knobs the hosted service doesn't expose: an env-driven search profile (depth, answer mode, raw_content, favicon, topic, chunks-per-source), on-disk TTL caching that absorbs repeat queries without burning credits, a per-call `usage.calls_this_session` budgeting signal from an in-process counter, `research_topic` / `fetch_document` prompts tuned for the empty-result fallback, and a loopback-only bind with no extra relay.
 
 ---
 
 ## 2. Protocol contract
 
-The agent (per [`docs/mcp.md`](https://github.com/example/rust-agent/blob/main/docs/mcp.md) §8) requires:
+The server is built on **FastMCP 4.0.11** and targets the **MCP 2026-07-28** revision. It is dual-era out of the box — modern clients negotiate the stateless protocol, legacy clients that send `initialize` still get a working session.
 
-1. Speaks **MCP 2024-11-05** (the version `rmcp 0.8` negotiates).
-2. Accepts JSON-args objects on `tools/call`.
-3. Returns either `structured_content` (preferred) or at least one text
-   content block.
-4. Advertises at least one tool on `tools/list`.
+| Contract | Value |
+| --- | --- |
+| Protocol revision | `2026-07-28` (advertised via `server/discover`; legacy `initialize` negotiates `2025-11-25`) |
+| Transports | Streamable HTTP at `/mcp` (default), stdio (opt-in via `TAVILY_TRANSPORT=stdio`) |
+| Bind address | `127.0.0.1` (loopback only; expose via VS Code port forwarding or ngrok — see `docs/DEPLOYMENT.md`) |
+| Authentication | **None.** Loopback binding is the only access control. Operate behind a trusted tunnel. |
+| Required response fields | `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` headers; tool list advertises `ttlMs`/`cacheScope` |
+| Server features | `tools` (two), `prompts` (two), `resources/templates` (none), `extensions: io.modelcontextprotocol/ui` |
 
-Anything beyond this contract is a server-side decision.
+Any modern MCP client (Claude Desktop, Cursor, opencode, VS Code Copilot Chat) that supports Streamable HTTP can connect to the forwarded URL without code changes.
 
 ---
 
-## 3. Tool
+## 3. Tools
 
-### `web_search` (single tool)
+### 3.1 `web_search`
 
 **Input schema** (JSON Schema, surfaced verbatim to the model):
 
@@ -59,13 +55,12 @@ Anything beyond this contract is a server-side decision.
 {
   "type": "object",
   "properties": {
-    "query":     { "type": "string",  "description": "..." },
-    "max_results": { "type": "integer", "minimum": 1, "maximum": 10,
-                     "default": 5,      "description": "..." },
-    "include_answer": { "type": "boolean", "default": true,
-                        "description": "..." },
-    "search_depth":   { "type": "string",  "enum": ["basic", "advanced"],
-                        "default": "basic", "description": "..." }
+    "query":         { "type": "string",  "description": "...",
+                       "minLength": 1 },
+    "max_results":   { "type": "integer", "description": "...",
+                       "default": 5 },
+    "force_refresh": { "type": "boolean", "description": "...",
+                       "default": false }
   },
   "required": ["query"],
   "additionalProperties": false
@@ -74,241 +69,419 @@ Anything beyond this contract is a server-side decision.
 
 | Argument | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `query` | string | yes | – | The search query. |
-| `max_results` | integer | no | 5 | Number of results to return. Clamped to `[1, 10]`. |
-| `include_answer` | bool | no | `true` | Whether to ask Tavily for a direct LLM-generated answer in addition to the result list. The answer (when present) is a single short paragraph; the model is told to verify it against the result URLs. |
-| `search_depth` | string | no | `"basic"` | `"basic"` (faster, fewer tokens, default) or `"advanced"` (slower, returns more content per result, costs more on paid plans). The `advanced` mode also crawls the result pages — for a full-page-body experience the right tool is `firecrawl__web_search`. |
+| `query` | string | yes | – | The search query. Trimmed before any cache lookup or upstream call; the trimmed query is echoed in the response. |
+| `max_results` | integer | no | 5 | Max results to return. **Clamped** to `[1, 10]` server-side (out-of-range values are not rejected, they are clamped). |
+| `force_refresh` | boolean | no | false | Bypass the on-disk cache and re-query Tavily even when a fresh-enough entry exists. |
 
 **Output** (`structured_content`, a JSON object):
 
 ```json
 {
-  "query": "what is the recommended way to configure a custom JSON logger in tokio",
-  "answer": "Use the tracing crate's json formatter with a subscriber...",
+  "query": "how to configure a custom JSON logger in tokio",
+  "answer": "Use the tracing crate's json formatter...",
   "results": [
-    { "title":   "...",
-      "url":     "...",
+    {
+      "title": "...",
+      "url":   "...",
       "content": "...",
-      "score":   0.92,
-      "raw_content": null }
+      "score": 0.92,
+      "raw_content": "...",
+      "raw_content_chars": 1234,
+      "raw_content_truncated_chars": 1234,
+      "truncated": false,
+      "published_date": null,
+      "favicon": "...",
+      "id": "..."
+    }
   ],
-  "source": "upstream" | "cache",
-  "request_id": "..."
+  "request_id": "abc-123",
+  "cache": "miss" | "hit" | "bypassed",
+  "note": "",
+  "usage": { "calls_this_session": 3 }
 }
 ```
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `query` | string | The query as the server received it. |
-| `answer` | string or `null` | A direct LLM-generated answer from Tavily, when `include_answer: true`. The model is told (in the tool description) to verify this against the result URLs — the answer can be wrong. |
-| `results` | array of `{title, url, content, score, raw_content}` | Mapped from Tavily's response. Capped at `max_results`. |
-| `source` | `"upstream"` or `"cache"` | Whether the response was served from the on-disk cache. |
+| `query` | string | The query as the server received it (after `trim()`). |
+| `answer` | string | A direct LLM-generated answer from Tavily when `TAVILY_INCLUDE_ANSWER` is truthy (default `"basic"`). May be an empty string if Tavily declined to answer. Treat it as a hint, verify against `results` URLs. |
+| `results` | array | Mapped from Tavily's `results[]`. Capped at `max_results`. |
 | `request_id` | string | Tavily's per-request ID. Echoed for operator-side debugging and quota reconciliation. |
+| `cache` | `"miss"` / `"hit"` / `"bypassed"` | Tells the model whether this call hit the cache, the network, or whether the caller opted out of the cache. |
+| `note` | string | Non-empty when the result list is empty; the model should rephrase or fall back to its own knowledge. |
+| `usage` | object | `calls_this_session` is the running counter for upstream Tavily calls in the current process. Tavily does not expose a live credit-balance endpoint; the model uses this counter to self-budget. |
 
 **Per-result fields:**
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `title` | string | Page title from the search result. |
+| `title` | string | Page title from the Tavily result. |
 | `url` | string | Canonical URL. |
-| `content` | string | LLM-friendly content snippet from the result page. Already cleaned (no HTML, no boilerplate). Capped per Tavily's defaults (~1k chars). |
-| `score` | float | Tavily's relevance score in `[0, 1]`. Not part of the tool description — operators may use it for analytics; the model should not over-index on it. |
-| `raw_content` | string or `null` | The un-cleaned raw content from the page. Populated by Tavily only for `search_depth: "advanced"`. For full-page-body needs, prefer `firecrawl__web_search`. |
+| `content` | string | LLM-friendly snippet (~1k chars by default from Tavily). Already cleaned (no HTML, no boilerplate). |
+| `score` | float | `[0, 1]` relevance score. Surface it but don't put it in the tool description. |
+| `raw_content` | string | The cleaned raw page body when `TAVILY_INCLUDE_RAW_CONTENT` is truthy (default `"markdown"`). Per-result length is capped at `TAVILY_MAX_RAW_CHARS` (default 8000). |
+| `raw_content_chars` | integer | Original body length before any truncation. |
+| `raw_content_truncated_chars` | integer | The cut length. Equal to `raw_content_chars` when no truncation happened. |
+| `truncated` | boolean | `true` when `raw_content` was truncated. |
+| `published_date` | string or null | Tavily's best estimate of publication date; only with `include_published_date=true` or `topic=news`. |
+| `favicon` | string or null | URL of the favicon when `TAVILY_INCLUDE_FAVICON=true` (default). |
+| `id` | string | Stable per-result ID; surface it so callers can dedupe across calls. |
 
 **Description (the model reads this verbatim):**
 
-> Free-tier, agent-tuned web search via Tavily. Reach for this when the query is **question-shaped or long-tail** and the `duckduckgo__web_search` tool's empty-response note is firing too often. Tavily returns clean, structured snippets (no HTML, no boilerplate) for any web query — entity-like, question-shaped, or comparison. Costs nothing on the free tier up to 1,000 calls/month. When `include_answer` is on (default) the response also includes a direct LLM-generated answer; treat that as a hint and verify it against the `results` URLs before quoting. For full page bodies as markdown, use `firecrawl__web_search` instead. Use `max_results` to cap the result list (default 5, max 10).
+> Web search via Tavily. Reach for this when the question is question-shaped, long-tail, or generally web-shaped and you want clean, LLM-ready snippets (not just links). Tavily charges credits per call (the signup tier is 1,000 credits/month; `advanced` depth is 2 credits, `basic`/`fast`/`ultra-fast` are 1); every response includes `usage.calls_this_session` so the model can self-budget. Pass `force_refresh=true` when the user explicitly wants fresh results or you know a previous result is stale. Per-result `raw_content` is capped at ~8k chars to protect context; the cut is visible via `raw_content_chars` / `raw_content_truncated_chars` and `truncated: true`.
+
+### 3.2 `extract_url`
+
+**Input schema:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "urls": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "maxItems": 20,
+      "description": "..."
+    },
+    "force_refresh": { "type": "boolean", "default": false, "description": "..." }
+  },
+  "required": ["urls"],
+  "additionalProperties": false
+}
+```
+
+| Argument | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `urls` | list of strings | yes | – | 1–20 URLs. Single URL → `urls: ["https://..."]`. Must be syntactically valid `http(s)` URLs. The cache key is the canonical-JSON encoding of the sorted, normalised URLs. |
+| `force_refresh` | boolean | no | false | Bypass the on-disk cache. |
+
+**Output** (`structured_content`, a JSON object):
+
+```json
+{
+  "urls": ["https://example.com/a", "https://example.com/b"],
+  "results": [
+    {
+      "url": "https://example.com/a",
+      "raw_content": "...",
+      "raw_content_chars": 4500,
+      "raw_content_truncated_chars": 4500,
+      "truncated": false,
+      "images": [],
+      "favicon": "..."
+    }
+  ],
+  "failed_results": [
+    { "url": "https://example.com/b", "error": "Page behind a paywall" }
+  ],
+  "request_id": "abc-123",
+  "cache": "miss" | "hit" | "bypassed",
+  "note": "",
+  "usage": { "calls_this_session": 4 }
+}
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `urls` | list of strings | The URLs the server received, normalised (whitespace-trimmed). |
+| `results` | array | Per-URL successful extractions. Each entry: `{url, raw_content, raw_content_chars, raw_content_truncated_chars, truncated, images, favicon}`. |
+| `failed_results` | array | Per-URL failures. Each entry: `{url, error}`. **HTTP 200 can have entries here** — Tavily returns per-URL failures even when the request itself succeeded. Surface every entry. |
+| `request_id` | string | Tavily's per-request ID. |
+| `cache` | `"miss"` / `"hit"` / `"bypassed"` | Tells the model whether this call hit the cache, the network, or whether the caller opted out. |
+| `note` | string | Non-empty when `results` is empty (every URL ended up in `failed_results`). The `failed_results` array carries the per-URL error; the model reads it explicitly. |
+| `usage` | object | `calls_this_session`. One extract call increments the counter by 1 (Tavily charges per URL inside the batch, not per call). |
+
+**Description (the model reads this verbatim):**
+
+> Extract clean content from one or more URLs via Tavily. Accepts 1–20 URLs in a single batch and returns per-URL `raw_content` plus a separate `failed_results` array for any URL that could not be extracted (HTTP 200 can have entries in both). Per-URL `raw_content` is capped at ~8k chars; the cut is visible via `raw_content_chars` / `raw_content_truncated_chars` and `truncated: true`. Pass `force_refresh=true` when the user explicitly wants fresh content or you know a page has changed. Every response includes `usage.calls_this_session` so the model can self-budget.
 
 ---
 
-## 4. Tavily API surface (v1)
+## 4. Response mapping (Tavily → MCP)
 
-The server uses the official `tavily-python` SDK. The relevant v1 endpoints:
+Both tools apply a thin mapping layer from Tavily's raw JSON onto the flat `structured_content` documented above.
 
-| Endpoint | Use |
-| --- | --- |
-| `POST /search` | The main tool. Body: `{api_key, query, max_results, include_answer, search_depth, ...}`. |
-| `GET /usage` | Optional. Per-month usage snapshot (used only if the server is asked to surface it via a future `credits`-like field; not required for v0.1). |
+### 4.1 `web_search`
 
-**Authentication:** the `api_key` is passed in the request body (not in a header), per Tavily's convention. The server reads `TAVILY_API_KEY` from the environment and threads it through.
+Tavily returns:
 
-**Rate limits:** the free tier is 1,000 requests/month. The `search_depth: "advanced"` mode also has per-request rate limits on some plans. The server should **not** implement its own retry policy beyond the SDK default; rate-limit errors are surfaced as `is_error: true` and the model decides whether to fall back.
+```json
+{
+  "query": "...",
+  "answer": "...",
+  "results": [
+    {
+      "title": "...",
+      "url": "...",
+      "content": "...",
+      "score": 0.9,
+      "raw_content": "...",
+      "favicon": "...",
+      "id": "..."
+    }
+  ],
+  "response_time": 0.42,
+  "request_id": "..."
+}
+```
+
+The mapper drops entries without a resolved `url`, caps the list at `max_results` (post-clamp), and applies the per-result `raw_content` truncation (when `raw_content` is non-null and longer than `TAVILY_MAX_RAW_CHARS`).
+
+### 4.2 `extract_url`
+
+Tavily returns:
+
+```json
+{
+  "results": [
+    {
+      "url": "...",
+      "raw_content": "...",
+      "images": [],
+      "favicon": "..."
+    }
+  ],
+  "failed_results": [
+    { "url": "...", "error": "..." }
+  ],
+  "response_time": 0.0,
+  "request_id": "..."
+}
+```
+
+Both arrays come through as-is; the mapper applies the per-URL `raw_content` truncation and drops empty-URL entries. HTTP 200 can return an empty `results[]` and a populated `failed_results[]` — that is a successful call, not an error.
 
 ---
 
 ## 5. Configuration
 
-All configuration is via environment variables. The Rust agent forwards the relevant ones when it spawns the server via the `env_pass` allow-list in `config/mcp.toml` — see the agent's [`docs/mcp.md`](https://github.com/example/rust-agent/blob/main/docs/mcp.md) §3 for the env-forwarding semantics.
+All configuration is via environment variables. See `.env.example` for the full list with defaults.
 
-| Variable | Required | Default | Purpose |
-| --- | --- | --- | --- |
-| `TAVILY_API_KEY` | yes | – | Tavily API key. Get a free one at <https://tavily.com>. Free tier: 1,000 requests/month. |
-| `TAVILY_CACHE_DIR` | no | `./cache/tavily` | On-disk cache directory. Gitignored. |
-| `TAVILY_CACHE_TTL_SECS` | no | `86400` | Cache freshness window, seconds. `0` disables. |
-| `TAVILY_MIN_INTERVAL_MS` | no | `200` | Minimum spacing between upstream Tavily calls. Tavily's free tier is generous but the polite default is to pace, not burst. |
-| `MAX_RESULTS_PER_CALL` | no | `10` | Hard upper bound the `max_results` argument is clamped to. Mirrors the DDG and Firecrawl servers. |
-| `DEFAULT_RESULTS_PER_CALL` | no | `5` | Default value when `max_results` is omitted. Mirrors the DDG and Firecrawl servers. |
-| `MCP_LOG_LEVEL` | no | `WARNING` | `DEBUG` / `INFO` / `WARNING`. Logs go to **stderr** (stdout is the JSON-RPC stream). |
-
-**API key is required.** The server refuses to start (lazy — on first call) without it.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TAVILY_API_KEY` | – | Tavily API key. **Required for both tools.** |
+| `TAVILY_TRANSPORT` | `http` | `http` (Streamable HTTP) or `stdio`. |
+| `TAVILY_HOST` | `127.0.0.1` | Bind address for HTTP transport. Loopback by design. |
+| `TAVILY_PORT` | `8000` | Port for HTTP transport. |
+| `TAVILY_PATH` | `/mcp` | URL path for the MCP endpoint. |
+| `TAVILY_CACHE_DIR` | `./cache/tavily` | On-disk cache directory. Gitignored. |
+| `TAVILY_CACHE_TTL_SECS` | `86400` | Cache freshness window in seconds. `0` disables the cache. |
+| `TAVILY_MAX_RAW_CHARS` | `8000` | Per-result cap on `raw_content` (~2k tokens). |
+| `TAVILY_MIN_INTERVAL_MS` | `200` | Minimum spacing between upstream Tavily calls in ms. `0` disables. |
+| `TAVILY_HTTP_TIMEOUT_S` | `60` | Upstream HTTP timeout in seconds. |
+| `TAVILY_SEARCH_DEPTH` | `advanced` | `basic` / `advanced` / `fast` / `ultra-fast`. |
+| `TAVILY_INCLUDE_ANSWER` | `basic` | Boolean or `basic` / `advanced`. The signup tier pays the same for the LLM answer regardless of mode. |
+| `TAVILY_INCLUDE_RAW_CONTENT` | `markdown` | Boolean or `markdown` / `text`. |
+| `TAVILY_INCLUDE_FAVICON` | `true` | Whether to include per-result favicons. |
+| `TAVILY_TOPIC` | `general` | `general` / `news` / `finance`. |
+| `TAVILY_CHUNKS_PER_SOURCE` | `3` | Joined chunks per result (1–3). |
+| `TAVILY_EXTRACT_DEPTH` | `basic` | `basic` / `advanced` (advanced = 2 credits per 5 successful URLs vs 1). |
+| `TAVILY_EXTRACT_FORMAT` | `markdown` | `markdown` / `text`. |
+| `TAVILY_EXTRACT_INCLUDE_FAVICON` | `true` | Per-URL favicon for `extract_url`. |
+| `MCP_LOG_LEVEL` | `WARNING` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. Logs go to **stderr** (stdout is the JSON-RPC stream). `FASTMCP_LOG_LEVEL` is honoured as a fallback. |
 
 ---
 
 ## 6. Caching
 
-On-disk TTL cache, key = normalised query (trimmed, inner whitespace collapsed, lowercased). File name = `<slug>-<fnv1a64>.json`. Envelope:
+On-disk TTL cache covering both tools. Key = normalised input. For `web_search`, the key is the trimmed, inner-whitespace-collapsed, lowercased query. For `extract_url`, the key is the JSON encoding of the sorted list of normalised URLs, so a single-URL call and a one-URL batch collide. File name = `<slug>-<fnv1a64>.json`.
+
+Envelope:
 
 ```json
-{ "fetched_at_unix": 1730000000,
-  "query": "...",
-  "answer": "...",
-  "results": [ ... ],
-  "request_id": "..." }
+{
+  "fetched_at_unix": 1730000000,
+  "kind": "search" | "extract",
+  "input": { "query": "..." } | { "urls": [...] },
+  "response": { ... mapped response minus the live usage block ... }
+}
 ```
+
+The cache stores the **full, untruncated** body. Truncation to `TAVILY_MAX_RAW_CHARS` is a presentation-time concern that the tools apply at response time, not at storage time. The `usage` block is **not** cached — every call returns a fresh counter view, but a cache hit does NOT increment the counter.
 
 **Failure semantics:** a missing, stale, corrupt, or unwritable cache entry **never fails the call**. The tool logs a `warn` and degrades to a plain uncached call.
 
-**Caching does not consume Tavily quota.** That's the whole point of the cache. The `source: "cache"` field in the response makes this visible to the model (useful for the model's own budgeting).
+**Bypass:** both tools take a `force_refresh: bool` arg; when `true`, the cache is bypassed and the response's `cache` field reports `"bypassed"` so the model can verify.
 
 The cache directory is gitignored. Delete any time to force fresh lookups.
 
 ---
 
-## 7. Install / setup
+## 7. Call counting and budget guidance
+
+Tavily has no live remaining-credit endpoint. The signup tier is 1,000 credits/month; the server cannot peek at the balance. Two choices were on the table, and the architecture chosen is **budget by self-counting**:
+
+1. **In-memory counter** — every successful upstream call increments `CallCounter.calls_this_session`. The same value is surfaced on every response as `usage.calls_this_session`. Two processes sharing one API key each count their own calls.
+2. **Polite pacing** — `TAVILY_MIN_INTERVAL_MS` (default 200 ms) spaces upstream calls so a runaway agent loop can't burst the budget out of a single process.
+
+The model is told in the tool description and in the `research_topic` / `fetch_document` prompts to switch to a free sibling search tool (e.g. `duck-search-mcp`) once the counter grows large. Operators who want a hard ceiling can lower `TAVILY_CACHE_TTL_SECS` and increase `TAVILY_MIN_INTERVAL_MS` to slow drift.
+
+There is no third "credit_status" tool: Tavily's optional `GET /usage` is a per-month summary, not a live balance, and adding a tool that returns just that would only encourage the model to chase a number that doesn't exist.
+
+---
+
+## 8. Privacy & Tavily Terms
+
+Tavily's [Terms of Service](https://www.tavily.com/terms) §6.5 and §9.2 explicitly state that Tavily and its third-party AI providers may use, retain, and process Customer Input and Outputs for purposes of training, improving, and developing their AI models. **Any query or URL you send through this server may be retained by Tavily for model-improvement purposes.** Operators with strict data-handling requirements should not use the Tavily paid tier through this MCP, or should scope the API key to a plan that includes a training-opt-out.
+
+The on-disk cache is operator-local — under `TAVILY_CACHE_DIR`, gitignored, deleted when the directory is removed. Tavily never sees what the cache stores.
+
+---
+
+## 9. Prompts
+
+### 9.1 `research_topic`
+
+A reusable user-message prompt that sets up a single `web_search` call. Args: `topic: str`. Returns a user message that:
+
+1. Tells the model to use `web_search` with a canonical topic name (not a question).
+2. Sets `max_results=5`.
+3. Defines the empty-result fallback: rephrase once, then fall back to the model's own knowledge and say so.
+4. Includes the call-counter reminder: every response includes `usage.calls_this_session`; the model is told to switch to a free sibling search tool once the count grows large.
+5. Includes the truncation reminder: when `truncated: true`, fall back to `extract_url` on the same URL with a focus.
+
+Registered on the same FastMCP instance as the tools. No extra setup.
+
+### 9.2 `fetch_document`
+
+A reusable user-message prompt that sets up a single `extract_url` call with `urls` and `focus`. Returns a user message that:
+
+1. Tells the model to use `extract_url` with the URL(s) as a JSON array (up to 20 per call).
+2. Asks the model to summarise the bodies around `focus`, dropping irrelevant sections before quoting.
+3. Reminds the model that per-URL `raw_content` is capped at ~8k chars and the cut is visible via `truncated: true`.
+4. Reminds the model that `failed_results` is the right place to look when URLs don't return content.
+
+Registered on the same FastMCP instance as the tools. No extra setup.
+
+---
+
+## 10. Install / setup
 
 ```bash
-cd rust-agent-tavily-mcp
-python3 -m venv .venv      # or: uv venv --python 3.12 .venv
+cd tavily-search-mcp
+python3 -m venv .venv           # or: uv venv --python 3.12 .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e .                # or: uv pip install -e .
+cp .env.example .env
+$EDITOR .env
 ```
 
-**Dependencies (suggested):**
+**Dependencies (pinned, per the project's `pyproject.toml`):**
 
-- `fastmcp>=2.0` — MCP server framework. (The project is `prefecthq/fastmcp` on GitHub but published as `fastmcp` on PyPI; it is the standard framework for building MCP servers in Python and powers most of the Python MCP ecosystem.)
-- `tavily-python>=0.5` — official Tavily SDK. Exposes the v1 `search()` and the optional `get_usage()`.
+- `fastmcp==4.0.11` — MCP server framework, the standalone PrefectHQ package.
+- `httpx>=0.27` — async HTTP client. The Tavily v1 API is a JSON-over-HTTPS surface with a Bearer token; an SDK adds no value here, and httpx gives us fail-open caching and timeout control with a single dependency.
 
-Tested with Python 3.10+. Other interpreters are fine as long as the `rmcp` 0.8 client on the agent side negotiates `2024-11-05` (the version `fastmcp` 2.x ships).
+Tested with Python 3.12. Works on 3.10+.
 
 ---
 
-## 8. Run by hand (for debugging)
+## 11. Run by hand
 
 ```bash
-# Set the API key first.
-export TAVILY_API_KEY=tvly-...
+# HTTP (default) — listen on http://127.0.0.1:8000/mcp
+python3 -m tavily_search_mcp
 
-# The server speaks JSON-RPC over stdio. A blank stdin will let
-# it sit idle; pipe a real `initialize` + `tools/list` exchange
-# to see the registered tool schema.
-python3 -m tavily_mcp
+# Stdio — for clients that spawn the server as a child process
+TAVILY_TRANSPORT=stdio python3 -m tavily_search_mcp
 ```
+
+A blank stdin in stdio mode lets the server sit idle. Point any MCP client (opencode, Claude Desktop, VS Code, Cursor) at the URL or spawn the process; see `docs/DEPLOYMENT.md` for the connection recipes.
 
 ---
 
-## 9. Integration with `rust-agent`
+## 12. Deployment
 
-Add a single entry to `config/mcp.toml` in the `rust-agent` repo:
+Two supported paths. Both rely on the server binding to `127.0.0.1`; neither requires the server itself to know it's being forwarded.
 
-```toml
-[[mcp.servers]]
-name = "tavily"
-command = ["/abs/path/to/rust-agent-tavily-mcp/.venv/bin/python",
-           "/abs/path/to/rust-agent-tavily-mcp/tavily_mcp/__main__.py"]
-env_pass = ["TAVILY_API_KEY", "PATH", "HOME"]
-enabled = true
-```
+1. **VS Code "Forward a Port"** (recommended). Open the Ports panel, forward `8000`, copy the URL, point your client at `<forwarded-url>/mcp`. The tunnel runs through Microsoft's relay — no public hostname to block.
+2. **ngrok** (fallback). `ngrok http 8000`, point your client at `<ngrok-url>/mcp`. Free-tier URLs are publicly enumerable; corporate networks often block them.
 
-Restart the agent. The model now sees the tool under its qualified name `tavily__web_search`. To temporarily disable without removing the entry, set `enabled = false` (the agent parses and validates the entry but skips spawning).
-
-The agent's `.env` (or wherever the operator keeps the key) should export `TAVILY_API_KEY`. The agent's `config/mcp.toml` entry's `env_pass` allow-list forwards it to the spawned subprocess.
-
-The default `web-search` MCP entry in `config/mcp.toml` (the bundled DDG + Firecrawl one) **must be removed or disabled** before the new Tavily entry is enabled, or the agent will register two `web_search` shaped tools and the model will be confused about which to use.
+For both, the server is started with `python3 -m tavily_search_mcp`. No auth is configured — the loopback bind + tunnel auth is the access control. See `docs/DEPLOYMENT.md` for the full step-by-step.
 
 ---
 
-## 10. Failure modes and how the model reacts
+## 13. Failure modes and how the model reacts
 
 | What goes wrong | What the tool does | What the model sees |
 | --- | --- | --- |
-| `TAVILY_API_KEY` not set | `is_error: true` on first call (lazy — no startup probe without a key) | "Tavily API key not set; reach for `duckduckgo__web_search` instead, or set `TAVILY_API_KEY` in the agent's environment." |
-| `TAVILY_API_KEY` invalid (`401`) | `is_error: true` with the 401 message | "Tavily rejected the API key." Operator notices; model falls back. |
-| Tavily rate limit (`429`) | The SDK retries with backoff (default 3 attempts); on exhaustion, `is_error: true` | A rate-limit error. The model can wait or fall back. |
-| Tavily monthly quota exhausted | `is_error: true` with a clear message | "Tavily quota exhausted for this billing period. Use `duckduckgo__web_search`." Model falls back. |
-| Cache directory unwritable | Logs `warn`; falls through to a plain uncached call | The tool still works, just slower on repeat queries (and quota will be spent). |
+| `TAVILY_API_KEY` not set | Both tools raise `ToolError("TAVILY_API_KEY is not set...")` on the first call | A clear error. Operator notices; no accidental credit spend. |
+| `TAVILY_API_KEY` invalid (401) | `ToolError("Tavily rejected the API key...")` | A clear HTTP error. Operator notices; model falls back. |
+| Tavily quota exhausted (432 / 433) | `ToolError("...quota exhausted...Switch to a free sibling...")` | A budget error. The model can switch to `duck-search-mcp` or wait. |
+| Tavily rate limit (429) | `ToolError("Tavily is rate-limiting this key...")` | A rate-limit error. The model can wait or fall back. |
+| Per-URL extraction failure | `extract_url` returns the URL in `failed_results` with `error` populated; HTTP 200 is still 200 | A normal success where one URL is explicitly flagged. The model reads `failed_results` and reacts. |
+| `raw_content` is `null` per result | The mapper renders `raw_content: ""`; `raw_content_chars: 0` | A normal result with empty raw_content; the model uses `content` (the snippet) instead. |
+| `result_count` is `[]` | `web_search` returns `results: []` with a non-empty `note` | A guidance note. The model can rephrase or fall back to its own knowledge. |
+| A result's page body exceeds the cap | Per-URL truncation to `TAVILY_MAX_RAW_CHARS`, with a marker and `truncated: true` | A normal success with a clearly marked cut. The model can call `extract_url` on the same URL with a focus. |
+| Cache directory unwritable | Logs `warn`; falls through to a plain uncached call | The tool still works, just slower on repeat queries (and credits will be spent). |
 | Cache file corrupt | Logs `warn`; falls through to a fresh upstream call | Same. |
-| Tavily endpoint changes shape | The mapper may return `results: []` for previously-working queries | Empty results without a `note` (Tavily is not entity-API-shaped — empty means "nothing matched"). The model can rephrase. |
-| MCP server child dies | The `rmcp` client surfaces an `ErrorData`; the tool returns a protocol-level error | A connection error. The supervisor loop's "two empty iterations" rule nudges the model. |
-| Server didn't spawn (venv missing or no key) | `build_agent` returns an error at agent startup | The agent refuses to start with a clear message naming the server and the command. **No silent fallback** — the design choice documented in `docs/mcp.md` §7. |
+| Foreign `Origin` header | Accepted when the server is bound to `127.0.0.1` (DNS rebinding isn't possible) | The probe flags this as a WARN; see `docs/DEPLOYMENT.md` for when to enable `http_host_origin_protection`. |
+| Server didn't start (port in use, venv missing, key missing) | Process exits with a clear log line on stderr | The client gets a connection error. No silent fallback. |
 
 ---
 
-## 11. Context-budget protection
+## 14. Acceptance criteria
 
-Tavily's per-result `content` is already capped server-side (Tavily returns ~1k chars per result by default, regardless of `max_results`). A 5-result call therefore adds at most ~5k tokens — well under the per-iteration budget. No per-result markdown cap is required on the client side; if the operator wants to be more aggressive, a `TAVILY_MAX_CONTENT_CHARS` cap can be added in a follow-up.
+The implementation is "good enough to ship" when **all** of the following hold:
 
-The agent's existing `RUST_AGENT_CONTEXT_PRESSURE_THRESHOLD_TOKENS` guard (default 800k, sized for MiniMax-M3's 1M-token window) covers the multi-call case end-to-end.
-
----
-
-## 12. Acceptance criteria (minimum viable)
-
-The implementation is "good enough to unblock the agent" when **all** of the following hold:
-
-1. `pip install -e .` from a clean checkout succeeds on Python 3.10+.
-2. `python3 -m tavily_mcp` starts and responds to a manual `initialize` + `tools/list` JSON-RPC exchange.
-3. The advertised tool is exactly `web_search`, with the input schema and description in §3.
-4. A live call against Tavily with a real key returns at least one result with title, URL, and content snippet.
-5. When `include_answer: true` (the default), the response includes a non-empty `answer` field.
-6. Two identical calls within the cache TTL produce a second response with `source: "cache"` and no upstream traffic.
-7. Setting `TAVILY_API_KEY` to an invalid value (or unsetting it on a real key) returns `is_error: true` with a clear message.
-8. The `max_results` argument is clamped to `[1, 10]`; values outside that range are clamped, not rejected.
-9. Spawning this server from the agent's `config/mcp.toml` succeeds, the model sees the tool as `tavily__web_search`, and a one-shot request (`cargo run -- run --request "What is the recommended way to configure a custom JSON logger in tokio?"`) triggers at least one call to it and ends with a non-empty final reply that cites at least one URL from the results.
+1. `pip install -e .` from a clean checkout succeeds on Python 3.10+. ✅
+2. With a real `TAVILY_API_KEY` set, `python3 -m tavily_search_mcp` starts on `http://127.0.0.1:8000/mcp` and answers `server/discover` with `supportedVersions: ["2026-07-28"]`. ✅
+3. The advertised tools are exactly `web_search` and `extract_url`, with the input schemas and descriptions in §3. ✅
+4. The advertised prompts are exactly `research_topic` and `fetch_document`. ✅
+5. A live `web_search` call against Tavily with a real key returns at least one result with title, URL, and content. ✅
+6. The response includes `usage.calls_this_session` and a non-zero counter after the first upstream call. ✅
+7. A second identical `web_search` call within the cache TTL produces a response with `cache: "hit"` and **no** increment to the call counter. ✅
+8. A single-URL `extract_url` call returns the page body and per-URL metadata. ✅
+9. A batch `extract_url` call with one URL in `failed_results` includes the failure with an `error` field. ✅
+10. A second identical `extract_url` call within the cache TTL produces `cache: "hit"`. ✅
+11. Setting `TAVILY_API_KEY` to an invalid value (or unsetting it on a real key) returns `ToolError` with a clear message from the affected tools. ✅
+12. A result whose page body exceeds `TAVILY_MAX_RAW_CHARS` is truncated and the `raw_content_chars` / `raw_content_truncated_chars` fields are populated correctly. ✅
+13. The wire probe (`.agents/skills/mcp-fastmcp-2026/scripts/probe_mcp_server.py`) reports 0 failures against the live server. ✅
+14. The in-process test suite (`pytest`) reports 0 failures in both `mode="auto"` and `mode="legacy"`. ✅
 
 ---
 
-## 13. Test plan
+## 15. Test plan
 
-Unit tests (hermetic, no network):
+Unit tests (hermetic, no network) live in `tests/`:
 
-- `cache_round_trip_serves_second_call_from_disk` — write a cache entry, read it back, assert `source: "cache"`.
-- `cache_corrupt_file_falls_through_to_upstream` — write garbage to a cache file, assert the call still succeeds (with a `warn` log).
-- `count_is_clamped_to_1_through_10` — assert `max_results=0` clamps to `1`, `max_results=11` clamps to `10`, `max_results=None` (omitted) defaults to `5`.
-- `query_is_trimmed_and_echoed` — assert `"  hello  "` is stored as `"hello"` and returned in the `query` field.
-- `missing_api_key_returns_clear_error` — unset `TAVILY_API_KEY`, assert the first call returns `is_error: true` with a "key not set" message.
-- `search_depth_is_passed_through` — assert the `search_depth` argument is forwarded to the Tavily SDK unchanged.
+- `test_normalize.py` — query and URL normalisation, slug, FNV-1a 64-bit hash, canonical batch key.
+- `test_cache.py` — round trip, normalisation equivalence, stale entry, corrupt file, unwritable dir, atomic write, kinds.
+- `test_rate_limit.py` — disabled at 0 ms, serial waits spaced, concurrent waits queued.
+- `test_call_counter.py` — increment, thread safety, snapshot isolation.
+- `test_tavily.py` — search and extract response mapping (entry filtering, raw_content truncation, null raw_content), error mapping (401/429/432/433/500), Bearer header propagation through a recording transport.
+- `test_server.py` — tool/prompt advertisement, basic search + extract, count clamp, empty result, cache hit, both client modes, force_refresh bypass, all error paths, batch extract with `failed_results`.
+- `test_server_integration.py` — real Tavily calls, skipped unless `TAVILY_NETWORK_TESTS=1`.
 
-Integration tests (network, gated on the venv and a real key existing):
+End-to-end (manual):
 
-- `mcp_server_advertises_web_search` — handshake, `tools/list`, assert exactly one tool named `web_search`.
-- `basic_search_returns_results_with_answer` — call with `include_answer: true`, assert `results.len() >= 1` and `answer` is non-empty.
-- `basic_search_long_tail_returns_results` — call a known-long-tail query that DDG would have returned empty for, assert at least one result (this is the marquee test for this server).
-- `second_call_within_ttl_serves_from_cache` — call twice, assert the second has `source: "cache"`.
-- `invalid_api_key_returns_clear_error` — point the server at an invalid key, assert the call returns `is_error: true` with a 401-style message.
-
-End-to-end (manual, smoke checklist from `docs/testing.md`):
-
-- `cargo run -- run --request "Design a tokio JSON logger skill set"`
-  — assert the trace contains at least one `tavily__web_search` call, and the final Markdown cites at least one URL from the results.
+- `python3 -m tavily_search_mcp` then connect from any modern MCP client (opencode, VS Code, Claude Desktop, Cursor) and confirm `web_search` and `extract_url` appear and return results.
+- Confirm `usage.calls_this_session` increments only on upstream calls (cache hits do not bump it).
 
 ---
 
-## 14. Out of scope for v0.1
+## 16. Out of scope for v0.1
 
-- **No Tavily Extract / Crawl / Research endpoints.** The single tool is `/search`. Extract (single-URL structured extraction), Crawl (whole-site crawl), and Research (multi-step deep research) are all out of scope for v0.1; if the agent ever needs them, they can be added as additional tools on the same server.
-- **No usage / quota introspection tool.** A `credits`-like field is not in the response shape (Tavily doesn't surface remaining quota via the search endpoint; the optional `get_usage()` call is per-month, not per-remaining). The agent is told to budget by counting its own calls. If a quota tool is added later, it would be a second tool on this server, not a new MCP.
-- **No rate-limit-aware retries beyond the SDK default.** The Tavily SDK retries 429s with backoff. Custom retry policies are out of scope.
-- **No HTTP transport.** Stdio only, per `docs/mcp.md` §6. When the agent's HTTP transport lands, this server may be wrapped behind a small stdio-to-HTTP shim, or a parallel HTTP entry point can be added later — out of scope for v0.1.
-- **No `include_raw_content` / `raw_content` parsing.** When `search_depth: "advanced"`, Tavily can return `raw_content` per result. The response echoes it through (the field is in the per-result shape) but the server does not parse, sanitise, or cache it specially. For full-page-body needs, use `firecrawl__web_search`.
+- **No other Tavily endpoints.** No `/crawl` (whole-site crawl), no `/map` (URL discovery), no `/research` (multi-step deep research), no `/feedback`, no `/usage`, no `/logs`. The two tools cover search and single-batch extraction only. If a future need arises, it can be added as a third tool on the same server.
+- **No keyless access.** Although Tavily offers keyless `/search` and `/extract` via `X-Tavily-Access-Mode: keyless`, this server is configured for an authenticated key. Adding keyless mode is straightforward but out of scope for v0.1.
+- **No advanced search knobs in the tool schema.** `topic`, `include_answer`, `include_raw_content`, `chunks_per_source`, `country`, `language`, `exclude_domains`, `exact_match`, etc. are all server-side env-configurable (`TAVILY_TOPIC`, `TAVILY_INCLUDE_ANSWER`, ...) and not exposed per-call. The start-up prompt's "Minimum tool surface" choice.
+- **No async polling.** None of the async Tavily endpoints (none in the current `/search` / `/extract` shape, but future ones may be) are exposed.
+- **No rate-limit-aware retries beyond a single attempt.** The shared `min_interval_ms` mutex spaces calls, and `429` / `432` / `433` responses surface to the model. Custom retry policies with backoff are out of scope.
+- **No proxy or per-call Tavily options override.** The defaults come from the env-driven profile. Operators can change them server-side.
+- **No parallel upstream calls.** A single in-flight upstream request is the unit. The shared `min_interval_ms` mutex serialises them.
 
 ---
 
-## 15. References
+## 17. References
 
-- Agent integration overview: [`docs/mcp.md`](https://github.com/example/rust-agent/blob/main/docs/mcp.md) in the `rust-agent` repo.
-- Agent's `tools::mcp` module-level reference: [`docs/modules/tools-mcp.md`](https://github.com/example/rust-agent/blob/main/docs/modules/tools-mcp.md).
-- Existing bundled DDG + Firecrawl MCP (the thing being split): [`mcp-servers/web-search/`](https://github.com/example/rust-agent/tree/main/mcp-servers/web-search) in the `rust-agent` repo. The current `mcp.toml` example for a `tavily` entry in the bundled MCP's docs is the direct ancestor of the integration snippet in §9.
-- Tavily API docs: <https://docs.tavily.com>.
-- `tavily-python` SDK: <https://github.com/tavily-ai/tavily-python>.
-- MCP specification: <https://modelcontextprotocol.io>.
-- `fastmcp` (Python MCP server framework): <https://github.com/PrefectHQ/fastmcp>.
+- MCP specification (target revision): https://modelcontextprotocol.io/specification/2026-07-28/
+- MCP `server/discover`: https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/discover
+- Tavily v1 API: https://docs.tavily.com/
+- Tavily `/search` reference: https://docs.tavily.com/documentation/api-reference/endpoint/search
+- Tavily `/extract` reference: https://docs.tavily.com/documentation/api-reference/endpoint/extract
+- Tavily Terms of Service: https://www.tavily.com/terms
+- Tavily credits & pricing: https://docs.tavily.com/documentation/api-credits
+- FastMCP (Python MCP server framework): https://github.com/PrefectHQ/fastmcp and https://gofastmcp.com
+- VS Code Streamable HTTP support: https://code.visualstudio.com/api/extension-guides/ai/mcp
